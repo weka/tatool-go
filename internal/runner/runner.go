@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/weka/tatool-go/internal/executor"
@@ -34,6 +35,7 @@ type RunConfig struct {
 	Exec      executor.Executor
 	Logger    *output.Logger
 	UseDzdo   bool
+	Progress  *output.Progress
 }
 
 // Run executes all scripts on all targets with goroutine-per-target parallelism.
@@ -55,6 +57,12 @@ func Run(ctx context.Context, cfg RunConfig) ([]TargetResult, error) {
 			parallel = append(parallel, s)
 		}
 	}
+
+	// Create progress display
+	totalScripts := len(parallel)*len(cfg.Targets) + len(single) + len(compare)*len(cfg.Targets)
+	progress := output.NewProgress(totalScripts)
+	cfg.Progress = progress
+	defer progress.Stop()
 
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -122,20 +130,19 @@ func Run(ctx context.Context, cfg RunConfig) ([]TargetResult, error) {
 
 func runScript(ctx context.Context, cfg RunConfig, target string, s script.Script) ScriptResult {
 	cfg.Logger.Log(target, fmt.Sprintf("Running %s: %s", s.Filename, s.Description))
+	cfg.Progress.Start(target, s.Filename)
 
 	result, err := cfg.Exec.Exec(ctx, target, s.Filename, cfg.UseDzdo)
 	if err != nil {
 		cfg.Logger.Log(target, fmt.Sprintf("ERROR %s: %v", s.Filename, err))
-		output.PrintResult(fmt.Sprintf("[%s] %s", target, s.Filename), "FAIL")
+		cfg.Progress.Finish(target, s.Filename, "FAIL")
 		return ScriptResult{Script: s, Result: result, Err: err}
 	}
 
 	status := string(result.Status)
 	cfg.Logger.Log(target, fmt.Sprintf("%s returned %s (code %d)", s.Filename, status, result.ExitCode))
 
-	output.PrintStdout(result.Stdout)
-	output.PrintStderr(result.Stderr)
-	output.PrintResult(fmt.Sprintf("[%s] %s", target, s.Filename), status)
+	cfg.Progress.Finish(target, s.Filename, status)
 
 	return ScriptResult{Script: s, Result: result}
 }
@@ -187,8 +194,12 @@ func PrintSummary(results []TargetResult) {
 	totalPass, totalFail, totalWarn := 0, 0, 0
 	maxNameLen := 0
 
-	// Also collect failed scripts
-	failedScripts := make(map[string][]string) // script -> list of targets
+	// Also collect failed scripts with their output
+	type failInfo struct {
+		targets []string
+		stderr  string // first non-empty stderr captured
+	}
+	failedScripts := make(map[string]*failInfo) // script -> info
 
 	for _, tr := range results {
 		s := stats{target: tr.Target}
@@ -198,7 +209,15 @@ func PrintSummary(results []TargetResult) {
 				s.pass++
 			case executor.StatusFail:
 				s.fail++
-				failedScripts[sr.Script.Filename] = append(failedScripts[sr.Script.Filename], tr.Target)
+				fi, ok := failedScripts[sr.Script.Filename]
+				if !ok {
+					fi = &failInfo{}
+					failedScripts[sr.Script.Filename] = fi
+				}
+				fi.targets = append(fi.targets, tr.Target)
+				if fi.stderr == "" && sr.Result.Stderr != "" {
+					fi.stderr = sr.Result.Stderr
+				}
 			case executor.StatusWarn:
 				s.warn++
 			}
@@ -283,15 +302,26 @@ func PrintSummary(results []TargetResult) {
 	fmt.Fprintln(os.Stdout, " │")
 	fmt.Fprintln(os.Stdout, "  "+hLine("└", "┴", "┘", "─"))
 
-	// List failed scripts
+	// List failed scripts with stderr
 	if len(failedScripts) > 0 {
 		fmt.Fprintln(os.Stdout)
 		output.Red.Fprintln(os.Stdout, "  Failed Scripts:")
-		for script, targets := range failedScripts {
-			if len(targets) == len(rows) {
-				fmt.Fprintf(os.Stdout, "    %s — all targets\n", script)
+		for scriptName, fi := range failedScripts {
+			if len(fi.targets) == len(rows) {
+				fmt.Fprintf(os.Stdout, "    %s — all targets\n", scriptName)
 			} else {
-				fmt.Fprintf(os.Stdout, "    %s — %d/%d targets\n", script, len(targets), len(rows))
+				fmt.Fprintf(os.Stdout, "    %s — %d/%d targets\n", scriptName, len(fi.targets), len(rows))
+			}
+			if fi.stderr != "" {
+				// Show first few lines of stderr
+				lines := strings.SplitN(strings.TrimSpace(fi.stderr), "\n", 4)
+				for i, line := range lines {
+					if i >= 3 {
+						output.Yellow.Fprintf(os.Stdout, "      ...\n")
+						break
+					}
+					output.Yellow.Fprintf(os.Stdout, "      %s\n", line)
+				}
 			}
 		}
 	}
