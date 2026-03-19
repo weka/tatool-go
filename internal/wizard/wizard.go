@@ -2,7 +2,9 @@ package wizard
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/huh"
@@ -183,16 +185,8 @@ func wizardSSH(cfg *config.Config) error {
 
 	switch authMethod {
 	case "key":
-		var keyPath string
-		form := huh.NewForm(
-			huh.NewGroup(
-				huh.NewInput().
-					Title("Path to SSH private key").
-					Placeholder("~/.ssh/id_ed25519").
-					Value(&keyPath),
-			),
-		)
-		if err := form.Run(); err != nil {
+		keyPath, err := selectSSHKey()
+		if err != nil {
 			return err
 		}
 		cfg.KeyFile = keyPath
@@ -261,6 +255,114 @@ func wizardScripts(cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+// selectSSHKey presents discovered SSH keys as a selectable list, with manual entry as fallback.
+func selectSSHKey() (string, error) {
+	keys := discoverSSHKeys()
+
+	if len(keys) == 0 {
+		// No keys found, fall back to manual input
+		var keyPath string
+		form := huh.NewForm(
+			huh.NewGroup(
+				huh.NewInput().
+					Title("Path to SSH private key").
+					Placeholder("~/.ssh/id_ed25519").
+					Value(&keyPath),
+			),
+		)
+		if err := form.Run(); err != nil {
+			return "", err
+		}
+		return keyPath, nil
+	}
+
+	// Build options from discovered keys + manual entry option
+	options := make([]huh.Option[string], 0, len(keys)+1)
+	for _, k := range keys {
+		label := k
+		if home, _ := os.UserHomeDir(); home != "" {
+			label = strings.Replace(k, home, "~", 1)
+		}
+		options = append(options, huh.NewOption(label, k))
+	}
+	options = append(options, huh.NewOption("Enter path manually...", "__manual__"))
+
+	var selected string
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Select SSH private key").
+				Options(options...).
+				Value(&selected),
+		),
+	)
+	if err := form.Run(); err != nil {
+		return "", err
+	}
+
+	if selected == "__manual__" {
+		var keyPath string
+		form := huh.NewForm(
+			huh.NewGroup(
+				huh.NewInput().
+					Title("Path to SSH private key").
+					Placeholder("~/.ssh/id_ed25519").
+					Value(&keyPath),
+			),
+		)
+		if err := form.Run(); err != nil {
+			return "", err
+		}
+		return keyPath, nil
+	}
+
+	return selected, nil
+}
+
+// discoverSSHKeys finds private key files in ~/.ssh/.
+func discoverSSHKeys() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+
+	sshDir := filepath.Join(home, ".ssh")
+	entries, err := os.ReadDir(sshDir)
+	if err != nil {
+		return nil
+	}
+
+	pubKeys := make(map[string]bool)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".pub") {
+			pubKeys[strings.TrimSuffix(e.Name(), ".pub")] = true
+		}
+	}
+
+	var keys []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Skip public keys, known_hosts, config, authorized_keys, .pem files
+		if strings.HasSuffix(name, ".pub") ||
+			name == "known_hosts" || name == "known_hosts.old" ||
+			name == "config" || name == "config.backup" ||
+			name == "authorized_keys" ||
+			name == "agent" {
+			continue
+		}
+		// Prefer files that have a matching .pub (strong signal it's a private key)
+		// Also include id_* files without .pub
+		if pubKeys[name] || strings.HasPrefix(name, "id_") {
+			keys = append(keys, filepath.Join(sshDir, name))
+		}
+	}
+
+	return keys
 }
 
 // fetchNamespaces runs kubectl to get all namespace names.
