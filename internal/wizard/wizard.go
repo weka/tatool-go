@@ -149,14 +149,57 @@ func wizardK8s(cfg *config.Config) error {
 }
 
 func wizardSSH(cfg *config.Config) error {
+	// Try to auto-discover backend IPs via local weka CLI
+	autoIPs := discoverWekaIPs()
+
 	var ipsStr, authMethod string
 
-	form := huh.NewForm(
+	if len(autoIPs) > 0 {
+		// Weka CLI available — offer auto-discovered IPs
+		var useAuto string
+		ipList := strings.Join(autoIPs, ", ")
+		form := huh.NewForm(
+			huh.NewGroup(
+				huh.NewSelect[string]().
+					Title(fmt.Sprintf("Found %d backend IPs via weka CLI", len(autoIPs))).
+					Options(
+						huh.NewOption(fmt.Sprintf("Use discovered IPs (%s)", ipList), "auto"),
+						huh.NewOption("Enter IPs manually", "manual"),
+					).
+					Value(&useAuto),
+			),
+		)
+		if err := form.Run(); err != nil {
+			return fmt.Errorf("IP selection: %w", err)
+		}
+		if useAuto == "auto" {
+			cfg.IPs = autoIPs
+		}
+	}
+
+	if len(cfg.IPs) == 0 {
+		// No auto-discovery or user chose manual
+		ipForm := huh.NewForm(
+			huh.NewGroup(
+				huh.NewInput().
+					Title("Enter IP address (or comma-separated IPs)").
+					Placeholder("10.0.0.1").
+					Value(&ipsStr),
+			),
+		)
+		if err := ipForm.Run(); err != nil {
+			return fmt.Errorf("IP input: %w", err)
+		}
+		if ipsStr != "" {
+			cfg.IPs = strings.Split(ipsStr, ",")
+			for i := range cfg.IPs {
+				cfg.IPs[i] = strings.TrimSpace(cfg.IPs[i])
+			}
+		}
+	}
+
+	authForm := huh.NewForm(
 		huh.NewGroup(
-			huh.NewInput().
-				Title("Enter IP address (or comma-separated IPs)").
-				Placeholder("10.0.0.1").
-				Value(&ipsStr),
 			huh.NewInput().
 				Title("SSH username").
 				Placeholder("root").
@@ -172,15 +215,8 @@ func wizardSSH(cfg *config.Config) error {
 		),
 	)
 
-	if err := form.Run(); err != nil {
+	if err := authForm.Run(); err != nil {
 		return fmt.Errorf("SSH details: %w", err)
-	}
-
-	if ipsStr != "" {
-		cfg.IPs = strings.Split(ipsStr, ",")
-		for i := range cfg.IPs {
-			cfg.IPs[i] = strings.TrimSpace(cfg.IPs[i])
-		}
 	}
 
 	switch authMethod {
@@ -321,48 +357,74 @@ func selectSSHKey() (string, error) {
 	return selected, nil
 }
 
-// discoverSSHKeys finds private key files in ~/.ssh/.
+// discoverSSHKeys finds private key files in ~/.ssh/ and .pem files in ~/.
 func discoverSSHKeys() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil
 	}
 
-	sshDir := filepath.Join(home, ".ssh")
-	entries, err := os.ReadDir(sshDir)
-	if err != nil {
-		return nil
-	}
-
-	pubKeys := make(map[string]bool)
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".pub") {
-			pubKeys[strings.TrimSuffix(e.Name(), ".pub")] = true
-		}
-	}
-
 	var keys []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+
+	// Scan ~/.ssh/ for private keys
+	sshDir := filepath.Join(home, ".ssh")
+	if entries, err := os.ReadDir(sshDir); err == nil {
+		pubKeys := make(map[string]bool)
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".pub") {
+				pubKeys[strings.TrimSuffix(e.Name(), ".pub")] = true
+			}
 		}
-		name := e.Name()
-		// Skip public keys, known_hosts, config, authorized_keys, .pem files
-		if strings.HasSuffix(name, ".pub") ||
-			name == "known_hosts" || name == "known_hosts.old" ||
-			name == "config" || name == "config.backup" ||
-			name == "authorized_keys" ||
-			name == "agent" {
-			continue
+
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasSuffix(name, ".pub") ||
+				name == "known_hosts" || name == "known_hosts.old" ||
+				name == "config" || name == "config.backup" ||
+				name == "authorized_keys" ||
+				name == "agent" {
+				continue
+			}
+			if pubKeys[name] || strings.HasPrefix(name, "id_") {
+				keys = append(keys, filepath.Join(sshDir, name))
+			}
 		}
-		// Prefer files that have a matching .pub (strong signal it's a private key)
-		// Also include id_* files without .pub
-		if pubKeys[name] || strings.HasPrefix(name, "id_") {
-			keys = append(keys, filepath.Join(sshDir, name))
+	}
+
+	// Scan home directory for .pem files
+	if entries, err := os.ReadDir(home); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if strings.HasSuffix(e.Name(), ".pem") {
+				keys = append(keys, filepath.Join(home, e.Name()))
+			}
 		}
 	}
 
 	return keys
+}
+
+// discoverWekaIPs runs `weka cluster servers list` locally to get backend IPs.
+func discoverWekaIPs() []string {
+	out, err := exec.Command("weka", "cluster", "servers", "list",
+		"--output", "ip", "--no-header", "--role", "backend").Output()
+	if err != nil {
+		return nil
+	}
+
+	var ips []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		ip := strings.TrimSpace(line)
+		if ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
 }
 
 // fetchNamespaces runs kubectl to get all namespace names.

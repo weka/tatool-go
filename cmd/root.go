@@ -67,9 +67,11 @@ func runWizard() error {
 		runErr = RunSSH(cfg)
 	}
 
-	// Print the rerun command hint
-	rerun := wizard.BuildRerunCommand(cfg)
-	fmt.Fprintf(os.Stderr, "\n\033[1m💡 To run this faster next time:\033[0m\n   %s\n\n", rerun)
+	// Print the rerun command hint only on success
+	if runErr == nil {
+		rerun := wizard.BuildRerunCommand(cfg)
+		fmt.Fprintf(os.Stderr, "\n\033[1m💡 To run this faster next time:\033[0m\n   %s\n\n", rerun)
+	}
 
 	return runErr
 }
