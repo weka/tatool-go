@@ -1,0 +1,8 @@
+# Binary
+tatool
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
