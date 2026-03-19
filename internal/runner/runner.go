@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -202,7 +203,8 @@ func PrintSummary(results []TargetResult) {
 	failedScripts := make(map[string]*failInfo) // script -> info
 
 	for _, tr := range results {
-		s := stats{target: tr.Target}
+		displayName := resolveTargetName(tr.Target)
+		s := stats{target: displayName}
 		for _, sr := range tr.Results {
 			switch sr.Result.Status {
 			case executor.StatusPass:
@@ -214,7 +216,7 @@ func PrintSummary(results []TargetResult) {
 					fi = &failInfo{}
 					failedScripts[sr.Script.Filename] = fi
 				}
-				fi.targets = append(fi.targets, tr.Target)
+				fi.targets = append(fi.targets, displayName)
 				if fi.stderr == "" && sr.Result.Stderr != "" {
 					fi.stderr = sr.Result.Stderr
 				}
@@ -229,6 +231,12 @@ func PrintSummary(results []TargetResult) {
 			maxNameLen = len(s.target)
 		}
 		rows = append(rows, s)
+	}
+
+	// Ensure TOTAL row label fits
+	totalLabel := fmt.Sprintf("TOTAL (%d targets)", len(rows))
+	if len(totalLabel) > maxNameLen {
+		maxNameLen = len(totalLabel)
 	}
 
 	// Clamp name length
@@ -284,7 +292,6 @@ func PrintSummary(results []TargetResult) {
 
 	// Total row
 	fmt.Fprintln(os.Stdout, "  "+hLine("├", "┼", "┤", "─"))
-	totalLabel := fmt.Sprintf("TOTAL (%d targets)", len(rows))
 	fmt.Fprintf(os.Stdout, "  │ %-*s │", maxNameLen, totalLabel)
 	output.Green.Fprintf(os.Stdout, " %4d", totalPass)
 	fmt.Fprint(os.Stdout, " │")
@@ -333,4 +340,23 @@ func repeat(s string, n int) string {
 		result += s
 	}
 	return result
+}
+
+// resolveTargetName tries reverse DNS on IP targets to show a hostname.
+// Returns "hostname (IP)" if resolved, or the original target if not.
+func resolveTargetName(target string) string {
+	ip := net.ParseIP(target)
+	if ip == nil {
+		return target // not an IP (e.g. pod name), keep as-is
+	}
+	names, err := net.LookupAddr(target)
+	if err != nil || len(names) == 0 {
+		return target
+	}
+	hostname := strings.TrimSuffix(names[0], ".")
+	// Use short hostname if it's an FQDN
+	if parts := strings.SplitN(hostname, ".", 2); len(parts) > 1 {
+		hostname = parts[0]
+	}
+	return fmt.Sprintf("%s (%s)", hostname, target)
 }
