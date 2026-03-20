@@ -1,6 +1,7 @@
 package wizard
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"github.com/weka/tatool-go/internal/config"
+	"github.com/weka/tatool-go/internal/discovery"
 	"github.com/weka/tatool-go/internal/script"
 	"github.com/weka/tatool-go/internal/selector"
 )
@@ -27,12 +29,18 @@ func RunWizard(defaultLogDir string) (*config.Config, error) {
 		return nil, err
 	}
 
-	if mode == "k8s" {
+	switch mode {
+	case "k8s":
 		cfg.K8s = true
 		if err := wizardK8s(cfg); err != nil {
 			return nil, err
 		}
-	} else {
+	case "ssm":
+		cfg.SSM = true
+		if err := wizardSSM(cfg); err != nil {
+			return nil, err
+		}
+	default:
 		if err := wizardSSH(cfg); err != nil {
 			return nil, err
 		}
@@ -56,6 +64,7 @@ func selectMode() (string, error) {
 				Options(
 					huh.NewOption("Kubernetes", "k8s"),
 					huh.NewOption("Traditional Weka (SSH)", "ssh"),
+					huh.NewOption("AWS SSM (no SSH required)", "ssm"),
 				).
 				Value(&mode),
 		),
@@ -150,7 +159,7 @@ func wizardK8s(cfg *config.Config) error {
 
 func wizardSSH(cfg *config.Config) error {
 	// Try to auto-discover backend IPs via local weka CLI
-	autoIPs := discoverWekaIPs()
+	autoIPs := discovery.WekaBackendIPs()
 
 	var ipsStr, authMethod string
 
@@ -246,6 +255,103 @@ func wizardSSH(cfg *config.Config) error {
 
 	return nil
 }
+
+func wizardSSM(cfg *config.Config) error {
+	// Running on an EC2 backend: region and credentials come from the instance
+	// profile automatically — no prompts needed.
+
+	// Step 1: try to get Weka backend IPs from the local weka CLI and resolve
+	// them to SSM instance IDs (most precise — only Weka backend nodes).
+	ips := discovery.WekaBackendIPs()
+	if len(ips) > 0 {
+		fmt.Printf("Discovered %d Weka backend IPs via weka CLI, resolving to SSM instance IDs...\n", len(ips))
+		instances, err := discovery.MatchInstancesByIP(context.Background(), "", ips)
+		if err == nil && len(instances) > 0 {
+			return wizardSSMSelectInstances(cfg, instances)
+		}
+		if err != nil {
+			fmt.Printf("SSM IP resolution failed (%v).\n", err)
+		} else {
+			fmt.Println("No SSM-managed instances matched the discovered IPs.")
+		}
+	}
+
+	// Step 2: fall back to listing all SSM-managed instances visible to this
+	// instance's role (broader but still avoids manual typing).
+	fmt.Println("Discovering all SSM-managed instances...")
+	instances, err := discovery.DiscoverSSMInstances(context.Background(), "", "")
+	if err == nil && len(instances) > 0 {
+		return wizardSSMSelectInstances(cfg, instances)
+	}
+	if err != nil {
+		fmt.Printf("SSM discovery failed (%v), falling back to manual entry.\n", err)
+	} else {
+		fmt.Println("No SSM-managed instances found, falling back to manual entry.")
+	}
+
+	// Step 3: last resort — manual text input.
+	return wizardSSMManual(cfg)
+}
+
+// wizardSSMSelectInstances lets the user confirm or select a subset of
+// SSM instances discovered automatically.
+func wizardSSMSelectInstances(cfg *config.Config, instances []discovery.SSMInstance) error {
+	options := make([]huh.Option[string], 0, len(instances)+1)
+	for _, inst := range instances {
+		options = append(options, huh.NewOption(inst.Label(), inst.InstanceID))
+	}
+	options = append(options, huh.NewOption("Enter instance IDs manually...", "__manual__"))
+
+	// Pre-select all discovered instances; leave "Enter manually" unselected.
+	selectedIDs := make([]string, len(instances))
+	for i, inst := range instances {
+		selectedIDs[i] = inst.InstanceID
+	}
+
+	pickForm := huh.NewForm(
+		huh.NewGroup(
+			huh.NewMultiSelect[string]().
+				Title(fmt.Sprintf("Select instances to target (%d found)", len(instances))).
+				Options(options...).
+				Value(&selectedIDs),
+		),
+	)
+	if err := pickForm.Run(); err != nil {
+		return fmt.Errorf("instance selection: %w", err)
+	}
+
+	for _, id := range selectedIDs {
+		if id == "__manual__" {
+			return wizardSSMManual(cfg)
+		}
+	}
+
+	cfg.InstanceIDs = selectedIDs
+	return nil
+}
+
+func wizardSSMManual(cfg *config.Config) error {
+	var raw string
+	form := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Instance IDs (comma-separated)").
+				Placeholder("i-0abc123def456,i-0def456abc123").
+				Value(&raw),
+		),
+	)
+	if err := form.Run(); err != nil {
+		return err
+	}
+	for _, id := range strings.Split(raw, ",") {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			cfg.InstanceIDs = append(cfg.InstanceIDs, id)
+		}
+	}
+	return nil
+}
+
 
 func wizardScripts(cfg *config.Config) error {
 	var scriptMode string
@@ -409,23 +515,6 @@ func discoverSSHKeys() []string {
 	return keys
 }
 
-// discoverWekaIPs runs `weka cluster servers list` locally to get backend IPs.
-func discoverWekaIPs() []string {
-	out, err := exec.Command("weka", "cluster", "servers", "list",
-		"--output", "ip", "--no-header", "--role", "backend").Output()
-	if err != nil {
-		return nil
-	}
-
-	var ips []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		ip := strings.TrimSpace(line)
-		if ip != "" {
-			ips = append(ips, ip)
-		}
-	}
-	return ips
-}
 
 // fetchNamespaces runs kubectl to get all namespace names.
 func fetchNamespaces(kubeconfig string) ([]string, error) {
@@ -473,14 +562,20 @@ func BuildRerunCommand(cfg *config.Config) string {
 	var parts []string
 	parts = append(parts, "./tatool run")
 
-	if cfg.K8s {
+	switch {
+	case cfg.K8s:
 		parts = append(parts, "--k8s")
 		parts = append(parts, fmt.Sprintf("--k8s-namespace %s", cfg.Namespace))
 		parts = append(parts, fmt.Sprintf("--cluster-name %s", cfg.ClusterName))
 		if cfg.Kubeconfig != "" {
 			parts = append(parts, fmt.Sprintf("--kubeconfig %s", cfg.Kubeconfig))
 		}
-	} else {
+	case cfg.SSM:
+		parts = append(parts, "--ssm")
+		if len(cfg.InstanceIDs) > 0 {
+			parts = append(parts, fmt.Sprintf("--instance-ids %s", strings.Join(cfg.InstanceIDs, ",")))
+		}
+	default:
 		if len(cfg.IPs) > 0 {
 			parts = append(parts, fmt.Sprintf("--ips %s", strings.Join(cfg.IPs, ",")))
 		}
