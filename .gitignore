@@ -7,3 +7,14 @@ tatool-linux-*
 .vscode/
 *.swp
 *.swo
+
+# macOS
+.DS_Store
+
+# Keys and secrets
+*.pem
+*.key
+
+# Test output
+test_results.json
+Working-images/

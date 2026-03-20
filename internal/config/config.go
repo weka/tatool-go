@@ -4,6 +4,7 @@ package config
 type Config struct {
 	// Mode
 	K8s bool
+	SSM bool
 
 	// SSH fields
 	IPs         []string
@@ -18,6 +19,11 @@ type Config struct {
 	Namespace   string
 	ClusterName string
 	Kubeconfig  string
+
+	// SSM fields
+	AWSRegion   string
+	AWSProfile  string
+	InstanceIDs []string
 
 	// Script selection
 	ScriptNums  []int

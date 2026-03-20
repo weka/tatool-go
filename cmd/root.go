@@ -61,9 +61,12 @@ func runWizard() error {
 	cfg.ScriptsPath = scriptsPath
 
 	var runErr error
-	if cfg.K8s {
+	switch {
+	case cfg.K8s:
 		runErr = RunK8s(cfg)
-	} else {
+	case cfg.SSM:
+		runErr = RunSSM(cfg)
+	default:
 		runErr = RunSSH(cfg)
 	}
 
